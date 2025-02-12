@@ -6,6 +6,7 @@ require('./sourcemap-register.js');/******/ (() => { // webpackBootstrap
 
 "use strict";
 
+// src/main.ts
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -52,6 +53,7 @@ const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
+// Initialize the new OpenAI client
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
 });
@@ -81,21 +83,37 @@ function getDiff(owner, repo, pull_number) {
             pull_number,
             mediaType: { format: "diff" },
         });
-        // @ts-expect-error - response.data is a string
+        // The diff is a string on response.data
         return response.data;
     });
+}
+/**
+ * Safely extract a line number from a parse-diff Change object
+ * without referencing any out-of-date or missing type fields.
+ */
+function getLineNumber(change) {
+    // Some parse-diff versions define "ln" or "ln2", some define "oldLine"/"newLine"
+    // We'll just check ln2, then ln, then fallback to empty string
+    if ("ln2" in change && change.ln2 !== undefined) {
+        return String(change.ln2);
+    }
+    else if ("ln" in change && change.ln !== undefined) {
+        return String(change.ln);
+    }
+    return "";
 }
 function analyzeCode(parsedDiff, prDetails) {
     return __awaiter(this, void 0, void 0, function* () {
         const comments = [];
         for (const file of parsedDiff) {
+            // Skip deleted files
             if (file.to === "/dev/null")
-                continue; // Ignore deleted files
+                continue;
             for (const chunk of file.chunks) {
                 const prompt = createPrompt(file, chunk, prDetails);
                 const aiResponse = yield getAIResponse(prompt);
                 if (aiResponse) {
-                    const newComments = createComment(file, chunk, aiResponse);
+                    const newComments = createComment(file, aiResponse);
                     if (newComments) {
                         comments.push(...newComments);
                     }
@@ -106,6 +124,10 @@ function analyzeCode(parsedDiff, prDetails) {
     });
 }
 function createPrompt(file, chunk, prDetails) {
+    // Build the diff snippet as lines of "lineNumber content"
+    const diffText = chunk.changes
+        .map((change) => `${getLineNumber(change)} ${change.content}`)
+        .join("\n");
     return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
@@ -127,13 +149,13 @@ Git diff to review:
 
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
-        .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-        .join("\n")}
+${diffText}
 \`\`\`
 `;
 }
+/**
+ * Calls OpenAI ChatCompletion endpoint, returns parsed "reviews" array from the JSON.
+ */
 function getAIResponse(prompt) {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
@@ -146,33 +168,36 @@ function getAIResponse(prompt) {
             presence_penalty: 0,
         };
         try {
-            const response = yield openai.chat.completions.create(Object.assign(Object.assign(Object.assign({}, queryConfig), (OPENAI_API_MODEL === "gpt-4-1106-preview"
-                ? { response_format: { type: "json_object" } }
-                : {})), { messages: [
-                    {
-                        role: "system",
-                        content: prompt,
-                    },
-                ] }));
-            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-            return JSON.parse(res).reviews;
+            // Build the messages array
+            const messages = [
+                {
+                    role: "system",
+                    content: prompt,
+                },
+            ];
+            // We can type-cast the result or leave it as any
+            const response = (yield openai.chat.completions.create(Object.assign(Object.assign({}, queryConfig), { messages })));
+            // Parse the text as JSON: { "reviews": [ ... ] }
+            const rawText = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
+            return JSON.parse(rawText).reviews;
         }
         catch (error) {
-            console.error("Error:", error);
+            console.error("OpenAI Error:", error);
             return null;
         }
     });
 }
-function createComment(file, chunk, aiResponses) {
-    return aiResponses.flatMap((aiResponse) => {
-        if (!file.to) {
-            return [];
-        }
-        return {
-            body: aiResponse.reviewComment,
-            path: file.to,
-            line: Number(aiResponse.lineNumber),
-        };
+/**
+ * Convert the AI response into GitHub review comments format.
+ */
+function createComment(file, aiResponses) {
+    return aiResponses.map((resp) => {
+        var _a;
+        return ({
+            body: resp.reviewComment,
+            path: (_a = file.to) !== null && _a !== void 0 ? _a : "",
+            line: Number(resp.lineNumber),
+        });
     });
 }
 function createReviewComment(owner, repo, pull_number, comments) {
@@ -190,22 +215,22 @@ function main() {
     var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const prDetails = yield getPRDetails();
-        let diff;
         const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
+        let diff = null;
         if (eventData.action === "opened") {
             diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
         }
         else if (eventData.action === "synchronize") {
-            const newBaseSha = eventData.before;
-            const newHeadSha = eventData.after;
+            const baseSha = eventData.before;
+            const headSha = eventData.after;
             const response = yield octokit.repos.compareCommits({
                 headers: {
                     accept: "application/vnd.github.v3.diff",
                 },
                 owner: prDetails.owner,
                 repo: prDetails.repo,
-                base: newBaseSha,
-                head: newHeadSha,
+                base: baseSha,
+                head: headSha,
             });
             diff = String(response.data);
         }
@@ -218,14 +243,20 @@ function main() {
             return;
         }
         const parsedDiff = (0, parse_diff_1.default)(diff);
+        // Optionally exclude certain paths
         const excludePatterns = core
             .getInput("exclude")
             .split(",")
             .map((s) => s.trim());
         const filteredDiff = parsedDiff.filter((file) => {
-            return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); });
+            if (!file.to)
+                return false;
+            // If any exclude pattern matches, skip
+            return !excludePatterns.some((pattern) => (0, minimatch_1.default)(file.to || "", pattern));
         });
+        // Get the suggestions from GPT
         const comments = yield analyzeCode(filteredDiff, prDetails);
+        // If GPT returned comments, post them
         if (comments.length > 0) {
             yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
         }
