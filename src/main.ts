@@ -2,48 +2,44 @@
 
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI, {
-  ChatCompletionMessageParam,
-  ChatCompletion,
-} from "openai";
+import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, {
-  File,
-  Chunk,
-  Change,
-  AddChange,
-  DelChange,
-  NormalChange,
-} from "parse-diff";
+import parseDiff, { File, Chunk, Change } from "parse-diff";
 import minimatch from "minimatch";
 
-/** Utility to determine a line number string for each type of change. */
-function getLineNumber(change: Change): string {
-  switch (change.type) {
-    case "add":
-      // AddChange has `ln2`
-      return String((change as AddChange).ln2);
-    case "del":
-      // DelChange has `ln`
-      return String((change as DelChange).ln);
-    default:
-      // NormalChange (there can be ln1, ln2, etc.)
-      const normal = change as NormalChange;
-      // For simplicity, just return ln2 if present
-      return normal.ln2 ? String(normal.ln2) : "";
-  }
-}
-
-// These come from your GitHub Action inputs/secrets
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
+// Initialize the new OpenAI client
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
+
+/**
+ * Local minimal type for an OpenAI chat message.
+ * Adjust as needed or replace with official types
+ * if your openai library version provides them.
+ */
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/** 
+ * If you want a fully typed response, define your own shape.
+ * For now, we'll just keep it flexible enough for the `.choices[0].message?.content`.
+ */
+interface OpenAIChatResponse {
+  choices: Array<{
+    message?: {
+      role: string;
+      content?: string;
+    };
+  }>;
+}
 
 interface PRDetails {
   owner: string;
@@ -53,7 +49,6 @@ interface PRDetails {
   description: string;
 }
 
-/** Fetch basic PR details. */
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
@@ -72,7 +67,6 @@ async function getPRDetails(): Promise<PRDetails> {
   };
 }
 
-/** Fetch the diff of the pull request as a string. */
 async function getDiff(
   owner: string,
   repo: string,
@@ -84,11 +78,25 @@ async function getDiff(
     pull_number,
     mediaType: { format: "diff" },
   });
-  // The GitHub API returns the diff as a string in `response.data`
+  // The diff is a string on response.data
   return response.data as unknown as string;
 }
 
-/** Main code analysis logic: loops through each file/chunk, calls GPT, builds comments. */
+/**
+ * Safely extract a line number from a parse-diff Change object
+ * without referencing any out-of-date or missing type fields.
+ */
+function getLineNumber(change: Change): string {
+  // Some parse-diff versions define "ln" or "ln2", some define "oldLine"/"newLine"
+  // We'll just check ln2, then ln, then fallback to empty string
+  if ("ln2" in change && change.ln2 !== undefined) {
+    return String(change.ln2);
+  } else if ("ln" in change && change.ln !== undefined) {
+    return String(change.ln);
+  }
+  return "";
+}
+
 async function analyzeCode(
   parsedDiff: File[],
   prDetails: PRDetails
@@ -96,7 +104,7 @@ async function analyzeCode(
   const comments: Array<{ body: string; path: string; line: number }> = [];
 
   for (const file of parsedDiff) {
-    // Ignore deleted files
+    // Skip deleted files
     if (file.to === "/dev/null") continue;
 
     for (const chunk of file.chunks) {
@@ -113,9 +121,8 @@ async function analyzeCode(
   return comments;
 }
 
-/** Creates a prompt for OpenAI based on the chunk content. */
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  // Convert chunk changes into a single string of "lineNumber content"
+  // Build the diff snippet as lines of "lineNumber content"
   const diffText = chunk.changes
     .map((change) => `${getLineNumber(change)} ${change.content}`)
     .join("\n");
@@ -148,7 +155,9 @@ ${diffText}
 `;
 }
 
-/** Call OpenAI ChatCompletion and parse the returned JSON. */
+/**
+ * Calls OpenAI ChatCompletion endpoint, returns parsed "reviews" array from the JSON.
+ */
 async function getAIResponse(
   prompt: string
 ): Promise<Array<{ lineNumber: string; reviewComment: string }> | null> {
@@ -162,30 +171,32 @@ async function getAIResponse(
   };
 
   try {
-    // Build a valid array of ChatCompletionMessageParam
-    const messages: ChatCompletionMessageParam[] = [
+    // Build the messages array
+    const messages: ChatMessage[] = [
       {
         role: "system",
         content: prompt,
       },
     ];
 
-    // Make the GPT call
-    const response: ChatCompletion = await openai.chat.completions.create({
+    // We can type-cast the result or leave it as any
+    const response = (await openai.chat.completions.create({
       ...queryConfig,
       messages,
-    });
+    })) as unknown as OpenAIChatResponse;
 
-    // Attempt to parse GPT output as JSON: { "reviews": [ ... ] }
-    const raw = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(raw).reviews;
+    // Parse the text as JSON: { "reviews": [ ... ] }
+    const rawText = response.choices[0].message?.content?.trim() || "{}";
+    return JSON.parse(rawText).reviews;
   } catch (error) {
     console.error("OpenAI Error:", error);
     return null;
   }
 }
 
-/** Convert the AI "reviews" into the structure expected by GitHub's createReview. */
+/**
+ * Convert the AI response into GitHub review comments format.
+ */
 function createComment(
   file: File,
   aiResponses: Array<{
@@ -193,14 +204,13 @@ function createComment(
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
-  return aiResponses.map((aiResponse) => ({
-    body: aiResponse.reviewComment,
-    path: file.to || "",
-    line: Number(aiResponse.lineNumber),
+  return aiResponses.map((resp) => ({
+    body: resp.reviewComment,
+    path: file.to ?? "",
+    line: Number(resp.lineNumber),
   }));
 }
 
-/** Submit the collected review comments to GitHub. */
 async function createReviewComment(
   owner: string,
   repo: string,
@@ -216,7 +226,6 @@ async function createReviewComment(
   });
 }
 
-/** Main entry point. */
 async function main() {
   const prDetails = await getPRDetails();
   const eventData = JSON.parse(
@@ -231,7 +240,6 @@ async function main() {
     const baseSha = eventData.before;
     const headSha = eventData.after;
 
-    // Compare commits to get a diff
     const response = await octokit.repos.compareCommits({
       headers: {
         accept: "application/vnd.github.v3.diff",
@@ -252,26 +260,24 @@ async function main() {
     return;
   }
 
-  // Parse the diff into a structured object
   const parsedDiff = parseDiff(diff);
 
-  // Exclude certain files from the analysis
+  // Optionally exclude certain paths
   const excludePatterns = core
     .getInput("exclude")
     .split(",")
     .map((s) => s.trim());
 
   const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) => {
-      if (!file.to) return false;
-      return minimatch(file.to, pattern);
-    });
+    if (!file.to) return false;
+    // If any exclude pattern matches, skip
+    return !excludePatterns.some((pattern) => minimatch(file.to || "", pattern));
   });
 
-  // Analyze the final set of files
+  // Get the suggestions from GPT
   const comments = await analyzeCode(filteredDiff, prDetails);
 
-  // If we have suggestions, submit them
+  // If GPT returned comments, post them
   if (comments.length > 0) {
     await createReviewComment(
       prDetails.owner,
@@ -282,7 +288,6 @@ async function main() {
   }
 }
 
-// Run the action
 main().catch((error) => {
   console.error("Error:", error);
   process.exit(1);
