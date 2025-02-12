@@ -1,4 +1,4 @@
-name: Build and Package
+name: Build, Package and Commit Artifacts
 
 on:
   push:
@@ -7,16 +7,18 @@ on:
 
 jobs:
   build:
+    # Skip the job if the commit message contains "[skip ci]"
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
 
     steps:
       # Check out the repository code
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       # Set up Node.js (adjust the version as needed)
       - name: Setup Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v3
         with:
           node-version: '16'
 
@@ -31,3 +33,22 @@ jobs:
       # Package the code
       - name: Package code
         run: yarn package
+
+      # Commit and push any changes (e.g. build artifacts) back to the repository.
+      # The commit message includes [skip ci] to prevent this commit from triggering the workflow.
+      - name: Commit changes
+        env:
+          # Use the GitHub token to authenticate the push.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          
+          # Check if there are any changes
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "Update build artifacts [skip ci]"
+            git push origin main
+          else
+            echo "No changes to commit."
+          fi
