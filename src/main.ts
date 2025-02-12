@@ -1,15 +1,40 @@
+// src/main.ts
+
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI from "openai";
+import OpenAI, {
+  ChatCompletionMessageParam,
+  ChatCompletion,
+} from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, { Chunk, File } from "parse-diff";
+import parseDiff, {
+  File,
+  Chunk,
+  Change,
+  AddChange,
+  DelChange,
+  NormalChange,
+} from "parse-diff";
 import minimatch from "minimatch";
 
-// Utility: sleep for X ms
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Utility to determine a line number string for each type of change. */
+function getLineNumber(change: Change): string {
+  switch (change.type) {
+    case "add":
+      // AddChange has `ln2`
+      return String((change as AddChange).ln2);
+    case "del":
+      // DelChange has `ln`
+      return String((change as DelChange).ln);
+    default:
+      // NormalChange (there can be ln1, ln2, etc.)
+      const normal = change as NormalChange;
+      // For simplicity, just return ln2 if present
+      return normal.ln2 ? String(normal.ln2) : "";
+  }
 }
 
+// These come from your GitHub Action inputs/secrets
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
@@ -28,6 +53,7 @@ interface PRDetails {
   description: string;
 }
 
+/** Fetch basic PR details. */
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
@@ -46,29 +72,23 @@ async function getPRDetails(): Promise<PRDetails> {
   };
 }
 
+/** Fetch the diff of the pull request as a string. */
 async function getDiff(
   owner: string,
   repo: string,
   pull_number: number
 ): Promise<string | null> {
-  // Basic rate-limiting guard for GitHub
-  // (You may also want a shared function with retry/backoff)
-  try {
-    const response = await octokit.pulls.get({
-      owner,
-      repo,
-      pull_number,
-      mediaType: { format: "diff" },
-    });
-    // @ts-expect-error - response.data is a string
-    return response.data;
-  } catch (error) {
-    // You could detect secondary rate limits here, sleep, and retry
-    console.error("GitHub getDiff error:", error);
-    return null;
-  }
+  const response = await octokit.pulls.get({
+    owner,
+    repo,
+    pull_number,
+    mediaType: { format: "diff" },
+  });
+  // The GitHub API returns the diff as a string in `response.data`
+  return response.data as unknown as string;
 }
 
+/** Main code analysis logic: loops through each file/chunk, calls GPT, builds comments. */
 async function analyzeCode(
   parsedDiff: File[],
   prDetails: PRDetails
@@ -76,12 +96,14 @@ async function analyzeCode(
   const comments: Array<{ body: string; path: string; line: number }> = [];
 
   for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
+    // Ignore deleted files
+    if (file.to === "/dev/null") continue;
+
     for (const chunk of file.chunks) {
       const prompt = createPrompt(file, chunk, prDetails);
       const aiResponse = await getAIResponse(prompt);
       if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
+        const newComments = createComment(file, aiResponse);
         if (newComments) {
           comments.push(...newComments);
         }
@@ -91,7 +113,13 @@ async function analyzeCode(
   return comments;
 }
 
+/** Creates a prompt for OpenAI based on the chunk content. */
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+  // Convert chunk changes into a single string of "lineNumber content"
+  const diffText = chunk.changes
+    .map((change) => `${getLineNumber(change)} ${change.content}`)
+    .join("\n");
+
   return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
@@ -115,65 +143,15 @@ Git diff to review:
 
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join("\n")}
+${diffText}
 \`\`\`
 `;
 }
 
-// A helper that wraps the OpenAI API call with basic retry & rate-limit logic.
-async function callOpenAIWithRateLimit(
-  queryConfig: Record<string, any>,
-  messages: Array<{ role: string; content: string }>,
-  maxRetries = 3
-) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      // Make the request
-      const response = await openai.chat.completions.create({
-        ...queryConfig,
-        messages,
-      });
-
-      // If the library supports returning headers, you could do:
-      // const remainingReq =
-      //   parseInt(response?.headers?.["x-ratelimit-remaining-requests"] ?? "60", 10);
-      // if (remainingReq < 5) {
-      //   console.warn("Approaching OpenAI rate limit, sleeping for 10s...");
-      //   await sleep(10000);
-      // }
-
-      return response;
-    } catch (err: any) {
-      // If we hit a 429 or an 'insufficient_quota' error, we can back off and retry.
-      if (
-        err.status === 429 ||
-        err.code === "insufficient_quota" ||
-        (err.error && err.error.code === "insufficient_quota")
-      ) {
-        const waitTime = 30_000; // 30s, or parse from err.headers if available
-        console.warn(
-          `OpenAI rate limit hit (attempt ${attempt}/${maxRetries}). Waiting ${waitTime} ms before retrying...`
-        );
-        await sleep(waitTime);
-      } else {
-        // Other errors are thrown immediately
-        throw err;
-      }
-    }
-  }
-  throw new Error(
-    `Failed to call OpenAI after ${maxRetries} attempts due to rate-limit or quota.`
-  );
-}
-
-async function getAIResponse(prompt: string): Promise<
-  Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }> | null
-> {
+/** Call OpenAI ChatCompletion and parse the returned JSON. */
+async function getAIResponse(
+  prompt: string
+): Promise<Array<{ lineNumber: string; reviewComment: string }> | null> {
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
@@ -184,47 +162,51 @@ async function getAIResponse(prompt: string): Promise<
   };
 
   try {
-    const response = await callOpenAIWithRateLimit(queryConfig, [
-      { role: "system", content: prompt },
-    ]);
+    // Build a valid array of ChatCompletionMessageParam
+    const messages: ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: prompt,
+      },
+    ];
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(res).reviews;
+    // Make the GPT call
+    const response: ChatCompletion = await openai.chat.completions.create({
+      ...queryConfig,
+      messages,
+    });
+
+    // Attempt to parse GPT output as JSON: { "reviews": [ ... ] }
+    const raw = response.choices[0].message?.content?.trim() || "{}";
+    return JSON.parse(raw).reviews;
   } catch (error) {
     console.error("OpenAI Error:", error);
     return null;
   }
 }
 
+/** Convert the AI "reviews" into the structure expected by GitHub's createReview. */
 function createComment(
   file: File,
-  chunk: Chunk,
   aiResponses: Array<{
     lineNumber: string;
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
-  return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
-      return [];
-    }
-    return {
-      body: aiResponse.reviewComment,
-      path: file.to,
-      line: Number(aiResponse.lineNumber),
-    };
-  });
+  return aiResponses.map((aiResponse) => ({
+    body: aiResponse.reviewComment,
+    path: file.to || "",
+    line: Number(aiResponse.lineNumber),
+  }));
 }
 
-// Basic helper for creating PR reviews on GitHub with limited concurrency/retries
+/** Submit the collected review comments to GitHub. */
 async function createReviewComment(
   owner: string,
   repo: string,
   pull_number: number,
   comments: Array<{ body: string; path: string; line: number }>
 ): Promise<void> {
-  // If you frequently hit secondary rate limits on GitHub,
-  // wrap this in a similar retry approach.
   await octokit.pulls.createReview({
     owner,
     repo,
@@ -234,34 +216,31 @@ async function createReviewComment(
   });
 }
 
+/** Main entry point. */
 async function main() {
   const prDetails = await getPRDetails();
-  let diff: string | null;
   const eventData = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
-  if (eventData.action === "opened") {
-    diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
-    );
-  } else if (eventData.action === "synchronize") {
-    const newBaseSha = eventData.before;
-    const newHeadSha = eventData.after;
+  let diff: string | null = null;
 
-    // Rate-limit handling for compareCommits if needed
+  if (eventData.action === "opened") {
+    diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
+  } else if (eventData.action === "synchronize") {
+    const baseSha = eventData.before;
+    const headSha = eventData.after;
+
+    // Compare commits to get a diff
     const response = await octokit.repos.compareCommits({
       headers: {
         accept: "application/vnd.github.v3.diff",
       },
       owner: prDetails.owner,
       repo: prDetails.repo,
-      base: newBaseSha,
-      head: newHeadSha,
+      base: baseSha,
+      head: headSha,
     });
-
     diff = String(response.data);
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
@@ -273,20 +252,26 @@ async function main() {
     return;
   }
 
+  // Parse the diff into a structured object
   const parsedDiff = parseDiff(diff);
 
+  // Exclude certain files from the analysis
   const excludePatterns = core
     .getInput("exclude")
     .split(",")
     .map((s) => s.trim());
 
   const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
-    );
+    return !excludePatterns.some((pattern) => {
+      if (!file.to) return false;
+      return minimatch(file.to, pattern);
+    });
   });
 
+  // Analyze the final set of files
   const comments = await analyzeCode(filteredDiff, prDetails);
+
+  // If we have suggestions, submit them
   if (comments.length > 0) {
     await createReviewComment(
       prDetails.owner,
@@ -297,6 +282,7 @@ async function main() {
   }
 }
 
+// Run the action
 main().catch((error) => {
   console.error("Error:", error);
   process.exit(1);
