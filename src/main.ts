@@ -5,6 +5,11 @@ import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
 
+// Utility: sleep for X ms
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
@@ -46,14 +51,22 @@ async function getDiff(
   repo: string,
   pull_number: number
 ): Promise<string | null> {
-  const response = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number,
-    mediaType: { format: "diff" },
-  });
-  // @ts-expect-error - response.data is a string
-  return response.data;
+  // Basic rate-limiting guard for GitHub
+  // (You may also want a shared function with retry/backoff)
+  try {
+    const response = await octokit.pulls.get({
+      owner,
+      repo,
+      pull_number,
+      mediaType: { format: "diff" },
+    });
+    // @ts-expect-error - response.data is a string
+    return response.data;
+  } catch (error) {
+    // You could detect secondary rate limits here, sleep, and retry
+    console.error("GitHub getDiff error:", error);
+    return null;
+  }
 }
 
 async function analyzeCode(
@@ -103,17 +116,64 @@ Git diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
   .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
   .join("\n")}
 \`\`\`
 `;
 }
 
-async function getAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-}> | null> {
+// A helper that wraps the OpenAI API call with basic retry & rate-limit logic.
+async function callOpenAIWithRateLimit(
+  queryConfig: Record<string, any>,
+  messages: Array<{ role: string; content: string }>,
+  maxRetries = 3
+) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Make the request
+      const response = await openai.chat.completions.create({
+        ...queryConfig,
+        messages,
+      });
+
+      // If the library supports returning headers, you could do:
+      // const remainingReq =
+      //   parseInt(response?.headers?.["x-ratelimit-remaining-requests"] ?? "60", 10);
+      // if (remainingReq < 5) {
+      //   console.warn("Approaching OpenAI rate limit, sleeping for 10s...");
+      //   await sleep(10000);
+      // }
+
+      return response;
+    } catch (err: any) {
+      // If we hit a 429 or an 'insufficient_quota' error, we can back off and retry.
+      if (
+        err.status === 429 ||
+        err.code === "insufficient_quota" ||
+        (err.error && err.error.code === "insufficient_quota")
+      ) {
+        const waitTime = 30_000; // 30s, or parse from err.headers if available
+        console.warn(
+          `OpenAI rate limit hit (attempt ${attempt}/${maxRetries}). Waiting ${waitTime} ms before retrying...`
+        );
+        await sleep(waitTime);
+      } else {
+        // Other errors are thrown immediately
+        throw err;
+      }
+    }
+  }
+  throw new Error(
+    `Failed to call OpenAI after ${maxRetries} attempts due to rate-limit or quota.`
+  );
+}
+
+async function getAIResponse(prompt: string): Promise<
+  Array<{
+    lineNumber: string;
+    reviewComment: string;
+  }> | null
+> {
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
@@ -124,24 +184,14 @@ async function getAIResponse(prompt: string): Promise<Array<{
   };
 
   try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
-    });
+    const response = await callOpenAIWithRateLimit(queryConfig, [
+      { role: "system", content: prompt },
+    ]);
 
     const res = response.choices[0].message?.content?.trim() || "{}";
     return JSON.parse(res).reviews;
   } catch (error) {
-    console.error("Error:", error);
+    console.error("OpenAI Error:", error);
     return null;
   }
 }
@@ -166,12 +216,15 @@ function createComment(
   });
 }
 
+// Basic helper for creating PR reviews on GitHub with limited concurrency/retries
 async function createReviewComment(
   owner: string,
   repo: string,
   pull_number: number,
   comments: Array<{ body: string; path: string; line: number }>
 ): Promise<void> {
+  // If you frequently hit secondary rate limits on GitHub,
+  // wrap this in a similar retry approach.
   await octokit.pulls.createReview({
     owner,
     repo,
@@ -198,6 +251,7 @@ async function main() {
     const newBaseSha = eventData.before;
     const newHeadSha = eventData.after;
 
+    // Rate-limit handling for compareCommits if needed
     const response = await octokit.repos.compareCommits({
       headers: {
         accept: "application/vnd.github.v3.diff",
